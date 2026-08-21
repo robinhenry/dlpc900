@@ -19,9 +19,7 @@ Status-command register/bit definitions used by `device.py` come from DLPU018
   (multi-bit Video Pattern Mode, per-pattern sync, flat-field correction) and
   what the client still needs to implement.
 
-## EDID backup
+## EDID
 
-`edid/dlp670s-evm.edid.bin` (+ `.hex.txt`) — the EVM's current EDID, read from
-the host before any reprogramming. Advertises **2560×1600 @ 30 Hz** (165 MHz,
-single-pixel). Keep as a rollback reference if you reprogram the EDID for
-dual-pixel / higher-resolution timings (DLPU102 §3.13).
+[`edid/README.md`](edid/README.md) — the EDID files for the DMD's HDMI/DP input,
+which one is flashed, and how to reflash (TI's Windows tool + the J3 jumper).

@@ -66,23 +66,17 @@ linear and predictable for the mask math. Equivalent to enabling the Linear
 
 ## Client status
 
-Implemented: discovery/connect, `read`/`write` primitives, status
-(hardware/system/main), identity (firmware/type), power mode get/set + reset,
-operating mode get/set (incl. `VIDEO_PATTERN`), timing constants.
+The code is the authoritative list: `src/dmd_client/device.py` for command
+coverage, `README.md` for the CLI surface. Mirroring it here is what went stale
+last time, so only the gaps that matter to *this* design are tracked:
 
-Implemented (minimal slice — DMD-master, free-running):
-- `PatternEntry` / `PatternSequence` + LUT Definition encoding (`0x1A34`).
-- `configure_pattern_sequence()` — stop → Definition ×N → Configuration (`0x1A31`).
-- `set_trigger_out_1()` (`0x1A1D`) — the camera sync signal.
-- `start_patterns()` / `pause_patterns()` / `stop_patterns()` (`0x1A24`).
-- `LedSelect.NONE` default (external illumination).
-- `set_it6535_power()` (`0x1A01`), `set_input_source()` (`0x1A00`).
-- `set_gamma()` / `disable_gamma()` (`0x1A3B`).
-- `set_port_clock()` (`0x1A03`) — see the board-specific note below.
-- `prepare_video_pattern_mode()` — one-call setup: stop → receiver → input
-  source → port/clock → gamma-off → VIDEO_PATTERN, in the required order.
-  Defaults to dual-pixel. Follow with `configure_pattern_sequence()` →
-  `set_trigger_out_1()` → `start_patterns()`.
+**Not implemented:**
+- `TRIG_OUT_1` configuration (`0x1A1D`) — the camera sync signal this whole
+  design rests on. `run_pattern_sequence()` is free-running today, so pattern
+  display is not yet tied to camera capture.
+- System status decode (`0x1A0B`). Hardware (`0x1A0A`) and main (`0x1A0C`,
+  incl. the sync-lock bits) are decoded.
+- Anything that pushes pixels — by design, that is the GPU's job.
 
 **Port/clock routing (`0x1A03`).** Board- and video-timing-specific (single- vs
 dual-pixel depends on the HDMI pixel clock). **Validated on our board: `0x00`
@@ -108,7 +102,8 @@ To enable dual-pixel:
    HDMI cable suffices; DisplayPort or Premium-High-Speed HDMI for margin.
 2. **EDID** — program the EVM to advertise the native timing so the GPU outputs
    it (DLPU102 §3.13; GUI batch file + jumper J3/HDMI or J4/DP). *Not doable from
-   this client.*
+   this client.* TI supplied a DP dual-pixel 60 Hz file
+   (`docs/edid/LCR9000_DP_EDID_2716_2560_60Hz.txt`) — untested.
 3. **Port/clock** — `set_port_clock(DataPort.PORT12_DUAL)` → `0x1A03 = 0x02`
    (Dual Pixel, Port 1-2, **Clock 1** — Clock 2/3 are not wired on the EVM).
 4. FPGA that splits data to both controllers ships programmed.
@@ -126,22 +121,25 @@ Confirmed against DLPC900 datasheet (DLPS037H): single-pixel max clock 175 MHz
 own dual-pixel example (1080p@120 = 138.4 MHz) is the same ballpark. Whole chain
 clears: IT6535 input ~275 MHz < 340 (HDMI 1.4), cable ~6.6 Gbit/s < 10.2.
 
-Requires: a **custom EDID** with reduced-blanking timing (that DTD as *preferred*,
-fixed checksum) + `set_port_clock(DataPort.PORT12_DUAL)` (`0x02`). Thin margin →
-must use near-minimum blanking and validate lock empirically (revert to the
-backup EDID if it doesn't hold). Stock TI EDIDs are all single-pixel; none offer
-this — it must be crafted.
+Requires: a reduced-blanking EDID (that DTD as *preferred*, fixed checksum) +
+`set_port_clock(DataPort.PORT12_DUAL)` (`0x02`). Thin margin → validate lock
+empirically (revert to `LCR670S_HDMI_EDID.txt` if it doesn't hold). No crafting
+needed: TI supplied the file via E2E — `LCR9000_DP_EDID_2716_2560_60Hz.txt`,
+DisplayPort, untested.
 
-### Stock EDID files (docs/edid/from-sw-bundle/)
+### EDID files
 
-- `LCR670S_HDMI_EDID.txt` = the factory EDID (= current): 2560×1600@30 +
-  2716×1600@30, both single-pixel.
+See [`edid/README.md`](edid/README.md) for the full table. **Currently flashed
+and verified live on the link: `LCR9000_HDMI_EDID_2716_30Hz.txt`** — 2716×1600 @
+30 Hz, single-pixel, reduced blanking (139.8 MHz, confirmed by re-dumping the
+host-side EDID). This replaced the factory 165 MHz timing, which is the one that
+froze Video Pattern Mode on the first microscope.
 
 ### Resolution / refresh options (decision reference)
 
 | Option | Resolution | fps | 1-bit pat/s | 8-bit pat/s | Pixel mode | Effort |
 |--|--|--|--|--|--|--|
-| **A** (running now) | 2716×1600 | 30 | 720 | 90 | single | none — current EDID |
+| **A** (running now) | 2716×1600 | 30 | 720 | 90 | single | none — EDID flashed |
 | **B** | 2048×1200 | 60 | 1440 | 180 | single | free reflash (`LCR670S_9000_..._HDMI`) |
 | **C** ★ chosen target | 2716×1600 | 60 | 1440 | 180 | dual | custom EDID + Windows flash |
 
@@ -152,7 +150,7 @@ this — it must be crafted.
   DLP670S 8-bit min-exposure ceiling (~247/s), so they're HDMI-limited.
 - **Decision:** target **C** when full-res-and-60 Hz is actually needed (and the
   optics resolve 2716×1600 at the sample). For now run **A** — zero effort. C is
-  deferred (custom EDID + Windows flash); feasibility confirmed above (~137 MHz
+  deferred (TI's DP EDID + Windows flash); feasibility confirmed above (~137 MHz
   dual-pixel < 141 limit).
 
 Still needed:
@@ -191,60 +189,53 @@ The pattern slice can't be meaningfully tested without the HDMI source feeding
 bit-planes + a camera, and switching to VIDEO_PATTERN Mode disturbs device
 state — so it's unit-tested only for now.
 
-### ⚠️ UNRESOLVED: status reads during video-active modes intermittently hang the controller
+### Status reads during video-active modes — resolved for VIDEO, open for VIDEO_PATTERN
 
-**Symptom:** while in VIDEO or VIDEO_PATTERN mode, a status **read** sometimes
-wedges the DLPC900's command interface — USB stays enumerated but every
-subsequent read returns "no response". A fresh USB reconnect does not help; only
-the **SW1 hardware reset** recovers (software reset can't — same hung path).
+**History.** Status **reads** in VIDEO or VIDEO_PATTERN mode used to wedge the
+DLPC900's command interface: USB stayed enumerated but every subsequent read
+returned "no response", and only the **SW1 hardware reset** recovered it (a
+software reset uses the same hung path). It hit 4 times early, then 13 runs in a
+row came back clean with no fix applied — so it was never deterministic, and
+three attempted fixes (writes-only mode entry, a 0.5 s settle before the first
+read, 5 ms command pacing) each "worked" only until it hung again. It was
+reproduced over the **kernel hidraw path** with hidapi/libusb bypassed, which
+placed the fault in the DLPC900 firmware rather than our USB layer. Ruled out by
+A/B test: read timeout length (reads answer in ms, so it is never exercised).
 
-**It is intermittent.** The exact same sequence (`prepare_video_input` → read
-`main_status` in VIDEO mode) *worked* on two early runs and *hung* on four later
-ones. Because it is non-deterministic, three fixes were tried and **all failed**:
-1. "Don't read during the VIDEO_PATTERN transition" (writes-only entry, Table 5-1) — still hung, on a VIDEO-mode read.
-2. "Settle 0.5 s before the first read" — still hung.
-3. "Pace commands 5 ms apart (like TI's batch files)" — still hung.
+**Status now: does not reproduce in VIDEO mode.** Retested after flashing the
+reduced-blanking EDID (`LCR9000_HDMI_EDID_2716_30Hz.txt`, 139.8 MHz):
 
-**Root cause = DLPC900 firmware, NOT the USB layer (confirmed).** Tested the same
-wedge scenario (VIDEO mode + hammered `main_status` reads) over the **kernel
-hidraw path** (raw `/dev/hidraw8`, bypassing hidapi/libusb) — **it wedged too**
-(writes then time out, `errno 110`). So switching USB backend does not help. The
-DLPC900 firmware (dlp670S_6.2.0) intermittently wedges when it gets **status
-reads while processing video**; it is fine in PRE_STORED, and tolerates slow
-sparse reads better than fast hammering. Matches the TI E2E thread
-"**DLPC900: Video Pattern Mode Frozen**" (403 for WebFetch; open in a browser).
+| Phase | Reads | Rate | Result |
+|--|--|--|--|
+| Paced, via `device.read()` | 7,145 over 5 fresh VIDEO entries | ~48/s | clean |
+| Unpaced, raw HID framing | 86,277 in 180 s | 479/s | clean |
 
-Ruled-out (wrong) theories, each disproved by a later hang or A/B test:
-read-during-VIDEO_PATTERN-transition; settle-before-read; 5 ms command pacing;
-libusb backend; **and the read-timeout (2 s→10 s) — A/B tested: reads are always
-~11 ms so the timeout is never exercised, and 2 s survives 5/5 just like 10 s.**
-The wedge is **genuinely intermittent** (identical configs, opposite outcomes:
-4 early hangs, then 13 clean runs in a row). Root cause remains unknown; none of
-the client-side changes provably fix it.
+**93,422 reads across 6 VIDEO-mode entries, zero wedges**, worst latency 3.8 ms.
+The old "tolerates sparse reads better than fast hammering" observation did not
+reproduce either. Note the causal story is still unproven — the wedge was
+reproduced below the level EDID influences, so "the EDID fixed it" is a
+hypothesis. The evidence is strong against a *per-read* hazard and weak against a
+*per-entry* one (only 6 entries).
 
-**Accepted design stance: treat VIDEO-mode status reads as unreliable and avoid
-depending on them.** Enter modes via writes, wait blind, and confirm via
-**external observation (scope on `TRIG_OUT_1`, camera)** — not USB status polling.
-Reads are reliable only in PRE_STORED. Pacing + generous timeout are kept as
-harmless hygiene, not as a fix.
+**Practical stance:**
+- **VIDEO mode — polling is fine.** `wait_for_video_lock()` polls main status
+  (`0x1A0C`) until the source locks, and `dmd stream-hdmi` reads the mode back to
+  confirm it is streaming. Lock now takes **0.8 s** on the reduced-blanking EDID,
+  down from 3.6 s on the factory timing.
+- **VIDEO_PATTERN mode — still read-free.** Nothing above covers it, and the
+  original hang lived there (a `0x1A1B` read right after the transition). Enter
+  by writes, and confirm via **external observation** (scope on `TRIG_OUT_1`,
+  camera) until that path is retested.
+- Keep a hardware recovery plan (SW1 / power-cycle) available before testing the
+  pattern path. Reads remain fully reliable in PRE_STORED.
 
-**From the E2E thread (near-identical microscopy setup):**
-- The TI **GUI polls status in video mode without hanging** → our command-hang is
-  specific to our client's USB read protocol, NOT a fundamental limit. Likely
-  differences to try: incrementing sequence numbers + response matching, drain
-  stale responses on timeout, a much longer read timeout (waits are fine).
+**From the TI E2E thread (near-identical microscopy setup):**
+- The TI **GUI polls status in video mode without hanging** — consistent with the
+  wedge being situational rather than a fundamental limit.
 - **Pattern exposure must match the frame time.** At 30 Hz (≈33 ms), 3 patterns →
-  **~11000 µs each** (not our 1500 µs, which is far too short and causes
-  frozen/flicker behavior).
-- **2716×1600 needs a special EDID that TI provides on request** (via E2E) — so
-  Option C's EDID exists; request it rather than only crafting one.
-
-**Design implication — go read-free while video-active.** The robust bring-up
-does **no status reads** in VIDEO/VIDEO_PATTERN: prepare (writes) → *fixed blind
-wait* for lock → configure + start (writes) → restore to PRE_STORED (writes) →
-read only there. Confirmation of lock / `sequencer_running` must come from
-**external observation** (scope on `TRIG_OUT_1`, camera), not USB polling.
-**5 SW1 resets — stop hardware retries until we have the E2E answer or a scope.**
+  **~11000 µs each** (not 1500 µs, which is far too short and causes the
+  frozen/flicker behavior). This is what `PatternSequence.frame_filling()` does.
+- **2716×1600 needs a special EDID** — TI supplied it; see `edid/README.md`.
 
 ### (original) VIDEO_PATTERN entry can hang the controller
 
@@ -262,8 +253,10 @@ Guardrails for the next attempt:
   read back only once it's running.
 - The correct entry order (VIDEO → sync-lock → VIDEO_PATTERN → LUT → start) needs
   verifying against a known-good reference (GUI/E2E) before retrying.
-- Rework `prepare_video_pattern_mode()` — its straight jump to VIDEO_PATTERN is
-  too aggressive.
+- ~~Rework `prepare_video_pattern_mode()` — its straight jump to VIDEO_PATTERN is
+  too aggressive.~~ **Done:** it is now `prepare_video_input()`, which stops at
+  VIDEO mode; `run_pattern_sequence()` does the VIDEO → lock wait →
+  VIDEO_PATTERN → LUT → start progression.
 - Always have a **hardware recovery plan (SW1 / power-cycle)** ready before any
   VIDEO_PATTERN test.
 
