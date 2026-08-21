@@ -1,6 +1,9 @@
 # dmd-client
 
-HID client for the DMD (digital micromirror device), built on [`hidapi`](https://pypi.org/project/hidapi/).
+HID client for the DMD (digital micromirror device), built on
+[`hidapi`](https://pypi.org/project/hidapi/). Drives a TI DLPC900 controller over
+USB — display mode, video input, internal test patterns — from the command line
+or as a library.
 
 ## Requirements
 
@@ -17,61 +20,62 @@ HID client for the DMD (digital micromirror device), built on [`hidapi`](https:/
 uv sync
 ```
 
+## Device permissions on Linux
+
+The DMD's `/dev/hidraw*` node is root-only by default, so the library can't open
+it. Install the shipped udev rule once per machine:
+
+```bash
+sudo cp udev/99-dmd.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug and replug the DMD.
+
 ## Usage
 
 ```bash
-uv run dmd status                    # find the DMD and report its details
-uv run dmd show checkerboard         # static test pattern, for optical alignment
-uv run dmd show black                # all mirrors off (a zeroed solid field)
-uv run dmd show --list               # list the pattern names
-uv run dmd stream-hdmi               # show the live HDMI signal on the DMD
-uv run dmd stream-dp                 # same over DisplayPort, dual-pixel @ 60 Hz
-uv run python -m dmd_client status   # same CLI, as a module
+uv run dmd status                   # find the DMD and report its details
+uv run dmd show checkerboard        # static internal test pattern (useful during alignment)
+uv run dmd show --list              # list the pattern names
+uv run dmd stream                   # live video from the GPU (default: DisplayPort, 60 Hz)
+uv run dmd stream hdmi              # ... over HDMI (30 Hz) instead
+uv run dmd -v stream                # ... logging every USB command sent
 ```
 
-`dmd show` uses the DLPC900's **internal** test-pattern generator: the
-controller draws the image itself, so it needs no HDMI source, GPU, pattern LUT,
-or camera sync, and the image never changes — a stable reference for aligning
-and focusing the optics. All ten generator patterns are available (`solid`,
-`horizontal-ramp`, `vertical-ramp`, `horizontal-lines`, `diagonal-lines`,
-`vertical-lines`, `grid`, `checkerboard`, `rgb-ramp`, `color-bars`) plus
-`black`. The pattern stays up until you change modes (e.g. start an acquisition
-sequence) or power-cycle, and while it is up the DMD ignores HDMI.
+`show` and `stream` correspond to two different image sources, and they are mutually exclusive. Both stay up until you change
+modes or power-cycle the DMD.
 
-`dmd stream-hdmi` is the other source: plain VIDEO mode, the DMD acting as a
-projector for whatever the GPU streams over HDMI (native resolution, single-pixel
-input — the hardware-validated path). It polls the controller's main status until
-the source locks, then reads back the mode and frame state, so it *confirms* the
-DMD is streaming instead of asking you to go look at it:
+### `dmd show` — internal test pattern
+
+The DLPC900 draws the image itself, so it needs no GPU, video link or pattern
+LUT, and it never changes: this is useful when aligning the optics.
+Ten generator supports options (`full`, `grid`, `checkerboard`, `horizontal-lines`,
+`vertical-lines`, `diagonal-lines`, `horizontal-ramp`, `vertical-ramp`,
+`rgb-ramp`, `color-bars`) plus `black`, which drives every mirror off.
+
+### `dmd stream` — live video from the GPU
+
+Plain VIDEO mode, the DMD acting as a projector. The default is DisplayPort at 2716×1600 @ 60 Hz. HDMI (30 Hz) is
+an alternative option. Each input has its own EDID, which must be flashed first — see [`edid-files/README.md`](edid-files/README.md).
+
+It polls the controller until the source locks and reads the mode back, so it
+*confirms* the DMD has correctly entered this mode:
 
 ```
-DMD is streaming the live HDMI signal — confirmed by the controller:
+DMD is streaming the live DisplayPort signal — confirmed by the controller:
   mode           VIDEO
-  source         locked in 0.8 s
+  source         locked in 2.8 s
   port 1 syncs   valid
   frames         changing (video not frozen)
+  routing        dual-pixel (0x1A03 = 0x02)
+Native resolution. Stays up until you change modes.
 ```
 
-It exits non-zero if the source never locks (dead cable, GPU not driving the
-output) instead of silently claiming success.
+## As a library
 
-`dmd stream-dp` is the same thing over DisplayPort at **2716×1600 @ 60 Hz**, the
-full-resolution path (~270 Mpix/s). One DLPC900 could not take that on a single
-port, but this is a dual-controller board: the Video Splitter FPGA gives each
-controller half the array (~135 Mpix/s), inside the single-pixel limit — so the
-routing stays `PORT1_SINGLE` like the HDMI path. `--dual-pixel` selects
-`0x1A03 = 0x02` instead; both lock identically here. Requires the DP EDID to be
-flashed — see [`docs/edid/README.md`](docs/edid/README.md).
-`scripts/check_edid.py` verifies which EDID is live:
-
-```bash
-uv run scripts/check_edid.py                       # decode the live link
-uv run scripts/check_edid.py --file docs/edid/...  # decode a TI batch file offline
-```
-
-The library locates the DMD automatically by its USB vendor/product ID
-(`0451:c900`), so it does not matter which USB port or bus the device is on —
-plugging it into a different port needs no reconfiguration. From code:
+The DMD is located by USB vendor/product ID (`0451:c900`), so it does not matter
+which port or bus it is on — moving it needs no reconfiguration.
 
 ```python
 import dmd_client
@@ -82,14 +86,20 @@ with dmd_client.connect() as dmd:    # find + open; closes automatically
         raise RuntimeError("controller/DMD mismatch")
 ```
 
+Logging follows the usual library convention: `dmd_client` logs to a
+`logging.getLogger(__name__)` and configures nothing else. The CLI is what attaches
+handlers.
+
 ## Project structure
 
 ```
-src/dmd_client/     importable package (installed as `dmd-client`)
-  device.py         device discovery/connection (find_device, open_device)
-  cli.py            the `dmd` command — status, show, stream-hdmi
+src/dmd_client/     importable package (distribution name: dmd-client)
+  device.py         discovery, connection, and the DLPC900 command set
+  cli.py            the `dmd` command — status, show, stream
   __main__.py       enables `python -m dmd_client`
 scripts/            standalone helper scripts, run directly with `uv run`
+edid-files/         EDIDs for the DMD's HDMI/DisplayPort inputs
+docs/               TI reference PDFs and design notes
 udev/               udev rule granting non-root access to the DMD
 tests/unit/         fast tests, no hardware (hid mocked)
 tests/hardware/     tests needing a connected DMD (marked `hardware`)
@@ -102,19 +112,7 @@ uv run pytest                 # unit tests only — safe anywhere, no hardware
 uv run pytest -m hardware     # hardware tests — needs a connected DMD
 ```
 
-Hardware tests are marked `hardware` and deselected by default (see
-`addopts` in `pyproject.toml`), so a bare `pytest` never runs anythinbg on real device.
-When run with `-m hardware`, they *skip* if no DMD is connected and *fail* if
-one is connected but not openable (e.g. the udev rule below isn't installed).
-
-## Device permissions on Linux
-
-The DMD's `/dev/hidraw*` node is root-only by default, so the library can't
-open it. Install the shipped udev rule once per machine:
-
-```bash
-sudo cp udev/99-dmd.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-Then unplug and replug the DMD.
+Hardware tests are deselected by default (see `addopts` in `pyproject.toml`), so
+a bare `pytest` never touches a real device. With `-m hardware` they *skip* if no
+DMD is connected, and *fail* if one is connected but not openable — e.g. the
+udev rule above isn't installed.

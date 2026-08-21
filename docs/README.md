@@ -21,5 +21,5 @@ Status-command register/bit definitions used by `device.py` come from DLPU018
 
 ## EDID
 
-[`edid/README.md`](edid/README.md) — the EDID files for the DMD's HDMI/DP input,
+[`../edid-files/README.md`](../edid-files/README.md) — the EDID files for the DMD's HDMI/DP input,
 which one is flashed, and how to reflash (TI's Windows tool + the J3 jumper).

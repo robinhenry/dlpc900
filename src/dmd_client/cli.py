@@ -1,26 +1,17 @@
-"""Command-line entry point for dmd-client (the `dmd` command).
-
-Subcommands::
+"""The `dmd` command.
 
     dmd status                  # find the DMD and report its details
-    dmd show checkerboard       # put a static internal test pattern on the DMD
-    dmd show --list             # list the pattern names
-    dmd stream-hdmi             # display the live HDMI signal on the DMD
-    dmd stream-dp               # same, over DisplayPort at 60 Hz
+    dmd show checkerboard       # static internal test pattern (optical alignment)
+    dmd stream                  # live video signal, DisplayPort by default
+    dmd -v stream hdmi          # ... over HDMI, logging every USB command
 
-``show`` drives the DLPC900's internal test-pattern generator: the controller
-draws the image itself, so nothing depends on HDMI, the GPU, a pattern LUT, or
-camera sync, and the image on the mirrors never changes. That makes it the
-reference to align and focus the optics against.
-
-``stream-hdmi`` / ``stream-dp`` are the opposite source: plain VIDEO mode,
-mirrors showing whatever the GPU streams over the video link. All of these are
-mutually exclusive — each switches the input source away from the others — and
-they stay up until you change modes (e.g. start an acquisition sequence) or
-power-cycle.
+`show` and `stream` are mutually exclusive input sources — each switches the
+controller away from the other, and both stay up until you change modes or
+power-cycle. See docs/pattern-mode-design.md for the mode background.
 """
 
 import argparse
+import logging
 import sys
 
 from dmd_client.device import (
@@ -34,15 +25,14 @@ from dmd_client.device import (
     find_device,
 )
 
+logger = logging.getLogger(__name__)
+
 WHITE = (1023, 1023, 1023)
 BLACK = (0, 0, 0)
 
-# CLI name -> (test pattern, foreground color). These are all ten patterns the
-# generator offers (0x1203 values 0-9, DLPU018 Table 2-58), plus "black": a
-# solid field with the foreground driven to zero, which is the way to get a dark
-# DMD. (Value 10, "no pattern", is deliberately not exposed — it stops the
-# generator rather than clearing the array, so the mirrors keep holding whatever
-# was displayed last, which reads as a no-op.)
+# CLI name -> (test pattern, foreground). All ten generator patterns (0x1203
+# values 0-9, DLPU018 Table 2-58) plus "black", a zeroed solid field — see
+# docs/pattern-mode-design.md for why value 10 is not exposed.
 PATTERNS: dict[str, tuple[TestPattern, tuple[int, int, int]]] = {
     "full": (TestPattern.SOLID_FIELD, WHITE),
     "black": (TestPattern.SOLID_FIELD, BLACK),
@@ -57,26 +47,79 @@ PATTERNS: dict[str, tuple[TestPattern, tuple[int, int, int]]] = {
     "color-bars": (TestPattern.COLOR_BARS, WHITE),
 }
 
+# CLI name -> (receiver, port/clock routing, label, what to check if it never
+# locks). DP is the default: 60 Hz vs HDMI's 30 at the same resolution. The
+# routing is a property of the timing, not a choice: DP's 269.89 MHz is over the
+# 175 MHz single-pixel limit so the IT6535 sends two pixels per clock, while
+# HDMI's 139.8 MHz sends one. See docs/pattern-mode-design.md ("Port/clock").
+SOURCES = {
+    "dp": (
+        IT6535Power.DISPLAYPORT,
+        DataPort.PORT12_DUAL,
+        "DisplayPort",
+        "Check the DP cable is in J2, that the DP EDID is flashed "
+        "(edid-files/README.md), and that the GPU is driving 2716x1600 @ 60 Hz.",
+    ),
+    "hdmi": (
+        IT6535Power.HDMI,
+        DataPort.PORT1_SINGLE,
+        "HDMI",
+        "Check the HDMI cable and that the GPU is driving the DMD output.",
+    ),
+}
+
+
+class _MaxLevel(logging.Filter):
+    """Keep records below ``level`` — routes info/debug to stdout, not stderr."""
+
+    def __init__(self, level: int):
+        super().__init__()
+        self.level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self.level
+
+
+def configure_logging(verbose: bool = False) -> None:
+    """Send package logs to the console: results to stdout, problems to stderr.
+
+    Configures the ``dmd_client`` logger rather than the root logger, so
+    importing this package never hijacks an application's logging.
+    """
+    package_logger = logging.getLogger("dmd_client")
+    for handler in list(package_logger.handlers):
+        package_logger.removeHandler(handler)
+
+    fmt = "%(levelname)s %(name)s: %(message)s" if verbose else "%(message)s"
+    out = logging.StreamHandler(sys.stdout)
+    out.addFilter(_MaxLevel(logging.WARNING))
+    err = logging.StreamHandler(sys.stderr)
+    err.setLevel(logging.WARNING)
+    for handler in (out, err):
+        handler.setFormatter(logging.Formatter(fmt))
+        package_logger.addHandler(handler)
+
+    package_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    package_logger.propagate = False
+
 
 def cmd_status(_args: argparse.Namespace) -> int:
     """Report whether a DMD controller is connected."""
     info = find_device()
     if info is None:
-        print("DMD not found")
+        logger.error("DMD not found")
         return 1
-    print(f"Found DMD {info['vendor_id']:04x}:{info['product_id']:04x}")
+    logger.info("Found DMD %04x:%04x", info["vendor_id"], info["product_id"])
     return 0
 
 
 def cmd_show(args: argparse.Namespace) -> int:
     """Display a static internal test pattern on the DMD."""
     if args.list:
-        print("Available patterns:")
-        for name in PATTERNS:
-            print(f"  {name}")
+        logger.info("Available patterns:\n  %s", "\n  ".join(PATTERNS))
         return 0
     if args.pattern is None:
-        print("error: a pattern name is required (see --list)", file=sys.stderr)
+        logger.error("a pattern name is required (see --list)")
         return 2
 
     pattern, foreground = PATTERNS[args.pattern]
@@ -84,115 +127,75 @@ def cmd_show(args: argparse.Namespace) -> int:
         with connect() as dmd:
             dmd.show_test_pattern(pattern, foreground=foreground)
     except (DeviceNotFoundError, DevicePermissionError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 1
 
-    print(f"Showing static '{args.pattern}' pattern on the DMD.")
+    logger.info("Showing static '%s' pattern on the DMD.", args.pattern)
     return 0
 
 
-def _stream(
-    receiver: IT6535Power,
-    data_port: DataPort,
-    source: str,
-    pixel_mode: str,
-    hint: str,
-) -> int:
-    """Enter VIDEO mode on one video input and confirm the DMD is streaming it.
+def cmd_stream(args: argparse.Namespace) -> int:
+    """Display the live video signal on the DMD (plain VIDEO mode)."""
+    receiver, data_port, source, hint = SOURCES[args.source]
 
-    Shared by stream-hdmi and stream-dp: the sequence is identical, only the
-    receiver (0x1A01) and the port/clock routing (0x1A03) differ.
-    """
     try:
         with connect() as dmd:
-            # Catches a controller/DMD mismatch before touching the video path.
+            # Catch a controller/DMD mismatch before touching the video path.
             hw = dmd.hardware_status()
             if hw.incompatible:
-                print("error: controller/DMD incompatible", file=sys.stderr)
+                logger.error("controller/DMD incompatible")
                 return 1
             if not hw.initialized:
-                print("error: controller not initialized yet", file=sys.stderr)
+                logger.error("controller not initialized yet")
                 return 1
 
-            # Stop, power the receiver, 24-bit parallel input, the requested
-            # port/clock routing, gamma off, enter VIDEO mode.
-            dmd.prepare_video_input(receiver=receiver, data_port=data_port)
-
-            # Then confirm it worked, rather than waiting blind and hoping: poll
-            # until the source locks, and read back the mode and frame state.
+            outcome = dmd.prepare_video_input(
+                receiver=receiver, data_port=data_port, force_reset=args.reset
+            )
             try:
                 lock_s = dmd.wait_for_video_lock()
             except TimeoutError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                print(hint, file=sys.stderr)
+                logger.error("%s\n%s", exc, hint)
                 return 1
             mode = dmd.operating_mode()
             status = dmd.main_status()
     except (DeviceNotFoundError, DevicePermissionError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logger.error("%s", exc)
         return 1
 
     if mode is not OperatingMode.VIDEO or not status.streaming:
-        print(
-            f"error: DMD did not reach a streaming state "
-            f"(mode={mode}, locked={status.source_locked}, "
-            f"port1_syncs_valid={status.port1_syncs_valid}, "
-            f"port2_syncs_valid={status.port2_syncs_valid}, "
-            f"video_frozen={status.video_frozen})",
-            file=sys.stderr,
+        logger.error(
+            "DMD did not reach a streaming state (mode=%s, locked=%s, "
+            "port1_syncs_valid=%s, port2_syncs_valid=%s, video_frozen=%s)",
+            mode, status.source_locked, status.port1_syncs_valid,
+            status.port2_syncs_valid, status.video_frozen,
         )
         return 1
 
-    print(f"DMD is streaming the live {source} signal — confirmed by the controller:")
-    print(f"  mode           {mode}")
-    print(f"  source         locked in {lock_s:.1f} s")
-    print("  port 1 syncs   valid")
-    print("  frames         changing (video not frozen)")
-    print(f"  routing        {pixel_mode} (0x1A03 = {int(data_port):#04x})")
-    print("Native resolution. Stays up until you change modes.")
+    dual = data_port in (DataPort.PORT12_DUAL, DataPort.PORT21_DUAL)
+    logger.info(
+        "DMD is streaming the live %s signal — confirmed by the controller:\n"
+        "  mode           %s\n"
+        "  source         %s\n"
+        "  port 1 syncs   valid\n"
+        "  frames         changing (video not frozen)\n"
+        "  routing        %s (0x1A03 = %#04x)\n"
+        "Native resolution. Stays up until you change modes.",
+        source, mode,
+        "already locked" if outcome == "unchanged" else f"locked in {lock_s:.1f} s",
+        "dual-pixel" if dual else "single-pixel", int(data_port),
+    )
     return 0
-
-
-def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
-    """Display the live HDMI signal on the DMD (plain VIDEO mode)."""
-    return _stream(
-        receiver=IT6535Power.HDMI,
-        data_port=DataPort.PORT1_SINGLE,
-        source="HDMI",
-        pixel_mode="single-pixel",
-        hint="Check the HDMI cable and that the GPU is driving the DMD output.",
-    )
-
-
-def cmd_stream_dp(args: argparse.Namespace) -> int:
-    """Display the live DisplayPort signal on the DMD (plain VIDEO mode).
-
-    The full-resolution 60 Hz path: 2716x1600 @ 60 is ~270 Mpix/s, which a single
-    DLPC900 could not take on one port — but the Video Splitter FPGA gives each
-    of the two controllers half the array (~135 Mpix/s), inside the single-pixel
-    limit. So the default routing is PORT1_SINGLE, same as the HDMI path; both
-    routings lock identically on our board (see MainStatus.streaming).
-    ``--dual-pixel`` selects 0x1A03 = 0x02 for comparison.
-
-    Requires the DP EDID to be flashed (docs/edid/, DLPU102 3.13) — without it
-    the GPU will not offer the timing and the source never locks.
-    """
-    dual = getattr(args, "dual_pixel", False)
-    return _stream(
-        receiver=IT6535Power.DISPLAYPORT,
-        data_port=DataPort.PORT12_DUAL if dual else DataPort.PORT1_SINGLE,
-        source="DisplayPort",
-        pixel_mode="dual-pixel" if dual else "single-pixel per controller",
-        hint=(
-            "Check the DP cable is in J2, that the DP EDID is flashed "
-            "(docs/edid/README.md), and that the GPU is actually driving "
-            "2716x1600 @ 60 Hz."
-        ),
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dmd", description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="log every USB command sent to the controller",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     status = subparsers.add_parser("status", help="find the DMD and report its details")
@@ -217,21 +220,24 @@ def build_parser() -> argparse.ArgumentParser:
     show.set_defaults(func=cmd_show)
 
     stream = subparsers.add_parser(
-        "stream-hdmi",
-        help="display the live HDMI signal on the DMD (plain VIDEO mode)",
+        "stream",
+        help="display the live video signal on the DMD (plain VIDEO mode)",
     )
-    stream.set_defaults(func=cmd_stream_hdmi)
-
-    stream_dp = subparsers.add_parser(
-        "stream-dp",
-        help="display the live DisplayPort signal at 60 Hz (needs the DP EDID)",
+    stream.add_argument(
+        "source",
+        nargs="?",
+        default="dp",
+        choices=list(SOURCES),
+        metavar="SOURCE",
+        help="which video input to display: dp (default, 60 Hz) or hdmi (30 Hz)",
     )
-    stream_dp.add_argument(
-        "--dual-pixel",
+    stream.add_argument(
+        "--reset",
         action="store_true",
-        help="route as dual-pixel (0x1A03 = 0x02) instead of the default port 1",
+        help="drop and re-acquire the link even if it is already streaming "
+        "(the host sees a monitor unplug/replug)",
     )
-    stream_dp.set_defaults(func=cmd_stream_dp)
+    stream.set_defaults(func=cmd_stream)
 
     return parser
 
@@ -239,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(args.verbose)
     if args.command is None:
         parser.print_help()
         return 2

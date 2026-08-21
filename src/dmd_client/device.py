@@ -1,5 +1,6 @@
 """Discovery and connection helpers for the TI DLPC900 DMD controller."""
 
+import logging
 import struct
 import time
 from collections.abc import Generator
@@ -8,6 +9,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 import hid
+
+logger = logging.getLogger(__name__)
 
 # USB identifiers for the Texas Instruments DLPC900
 # (DLP LightCrafter 6500 / 9000 evaluation modules).
@@ -27,10 +30,15 @@ COMMAND_INTERVAL_S = 0.010
 # time-sensitive. Does not affect the video-mode hang (see docs).
 READ_TIMEOUT_MS = 5000
 
-# HDMI sync-lock poll. Lock took 3.6 s on the factory EDID; 10 s leaves margin
-# without hanging the caller forever on a dead cable or an idle GPU.
+# HDMI sync-lock poll. A forced re-acquisition locks in ~2.2 s; 10 s leaves
+# margin without hanging the caller forever on a dead cable or an idle GPU.
 LOCK_TIMEOUT_S = 10.0
 LOCK_POLL_INTERVAL_S = 0.1
+
+# How long to hold the IT6535 receiver powered down before bringing it back, so
+# the source sees the link drop and retrains. Measured: with no pause the link
+# never re-acquires (>15 s); with 0.5 s it locks in ~2.2 s, same as with 2 s.
+RECEIVER_RESET_S = 0.5
 
 # Shown whenever the device is present but not accessible — almost always
 # because the udev permission rule has not been installed yet.
@@ -123,6 +131,7 @@ def read(dev: "hid.device", command: int, seq: int = 1) -> bytes:
     time.sleep(COMMAND_INTERVAL_S)  # pace subsequent commands
     if not resp:
         raise DeviceError(f"no response to command {command:#06x}")
+    logger.debug("read  %#06x -> %s", command, bytes(resp[:8]).hex(" "))
     if resp[0] & 0x20:  # bit 5 of the flag byte = error
         raise DeviceError(f"command {command:#06x} failed (flag {resp[0]:#04x})")
 
@@ -144,6 +153,7 @@ def write(dev: "hid.device", command: int, data: bytes = b"", seq: int = 1) -> N
     packet = [0x00, 0x00, seq, length & 0xFF, (length >> 8) & 0xFF, *payload]
     if len(packet) > 65:
         raise ValueError("payload too large for a single HID transfer")
+    logger.debug("write %#06x <- %s", command, data.hex(" "))
     dev.write(packet + [0x00] * (65 - len(packet)))
     time.sleep(COMMAND_INTERVAL_S)  # pace subsequent commands (see COMMAND_INTERVAL_S)
 
@@ -210,17 +220,8 @@ class MainStatus:
     def streaming(self) -> bool:
         """True when locked to the source and showing new frames.
 
-        Port 2 is deliberately not required, even at dual-pixel/60 Hz. This is a
-        *dual-controller* board (DLP670S behind two DLPC900s): the Video Splitter
-        FPGA hands each controller half the array, ~135 Mpix/s at 2716x1600@60 —
-        under the 175 MHz single-pixel limit — so each controller reads its half
-        on port 1 alone. Status is also read from the primary controller only
-        (DLPU102 3.7), so the secondary's state never appears here regardless.
-
-        Measured on our board over the DP input: ``port2_syncs_valid`` is False
-        with 0x1A03 = 0x02 (dual) *and* 0x00 (single), identically. Requiring it
-        only produces false failures. On a single-controller EVM taking the whole
-        stream, dual-pixel would genuinely need both ports.
+        Port 2 is not required: it reads False even on a working dual-pixel link
+        (docs/pattern-mode-design.md, "Port/clock").
         """
         return self.source_locked and self.port1_syncs_valid and not self.video_frozen
 
@@ -553,26 +554,65 @@ class DMD:
         """
         self.write(0x1A03, bytes([int(data_port) & 0x03]))
 
+    def _parallel_link_live(self) -> bool:
+        """True if the parallel input is the current source and locked."""
+        if (self.read(0x1A00)[0] & 0x07) != int(InputSource.PARALLEL):
+            return False
+        return self.main_status().source_locked
+
+    def video_input_ready(
+        self, receiver: IT6535Power, data_port: DataPort
+    ) -> bool:
+        """True if the input is already configured this way and streaming.
+
+        Only bits 2:0 of 0x1A00 are compared; the bit-depth field does not read
+        back what was written.
+        """
+        if self.read(0x1A01)[0] != int(receiver):
+            return False
+        if (self.read(0x1A03)[0] & 0x03) != int(data_port):
+            return False
+        return self._parallel_link_live() and self.main_status().streaming
+
     def prepare_video_input(
         self,
         receiver: IT6535Power = IT6535Power.HDMI,
         data_port: DataPort = DataPort.PORT1_SINGLE,
-    ) -> None:
+        force_reset: bool = False,
+    ) -> str:
         """Set up the HDMI/DP input and enter VIDEO mode, the precondition for
         VIDEO_PATTERN. Writes only: stop, power receiver, parallel 24-bit input,
         port/clock, gamma off, VIDEO mode. Then wait blind for lock ->
         configure_pattern_sequence -> start_patterns.
 
-        data_port defaults to single-pixel (dual needs the matching EDID).
-        Status reads in a video-active mode can intermittently hang the
-        controller (SW1 to recover); avoid them — confirm lock externally.
+        A *live* parallel link keeps its latched routing, so changing
+        ``data_port`` there requires dropping the link — the receiver is powered
+        down for ``RECEIVER_RESET_S``, else the change is silently ignored
+        (docs/pattern-mode-design.md, "Port/clock"). The host sees that as a
+        monitor unplug/replug and re-lays-out every display, so it is done only
+        when needed: not when the input is already configured as asked, and not
+        when coming from another input source (the source switch re-acquires by
+        itself). ``force_reset`` overrides.
+
+        :returns: "unchanged" (nothing to do), "reconfigured" (set up without
+            dropping the link), or "reset" (link dropped to re-latch).
         """
+        if not force_reset and self.video_input_ready(receiver, data_port):
+            logger.debug("video input already configured as asked; nothing to do")
+            return "unchanged"
+
+        reset = force_reset or self._parallel_link_live()
         self.stop_patterns()
+        if reset:
+            logger.debug("dropping the link so the port routing re-latches")
+            self.set_it6535_power(IT6535Power.POWER_DOWN)
+            time.sleep(RECEIVER_RESET_S)
         self.set_it6535_power(receiver)
         self.set_input_source(InputSource.PARALLEL, ParallelBitDepth.BITS_24)
         self.set_port_clock(data_port)
         self.disable_gamma()
         self.set_operating_mode(OperatingMode.VIDEO)
+        return "reset" if reset else "reconfigured"
 
     def wait_for_video_lock(
         self,
@@ -581,17 +621,8 @@ class DMD:
     ) -> float:
         """Poll main status until the video source locks; return the seconds it took.
 
-        Replaces a blind wait in plain VIDEO mode: it returns as soon as the
-        source is actually locked, and distinguishes "not locked yet" from "never
-        going to lock" (dead cable, GPU not driving the output). Waits on port 1
-        only — see :attr:`MainStatus.streaming` for why port 2 never comes up on
-        this board.
-
-        Only for VIDEO mode. Status reads in a video-active mode were long treated
-        as unsafe (docs/pattern-mode-design.md), but that no longer reproduces on
-        the reduced-blanking EDID: 93,422 reads across 6 VIDEO-mode entries, up to
-        479 reads/s, zero wedges. The VIDEO_PATTERN path is *not* covered by that
-        evidence — keep it read-free.
+        VIDEO mode only — VIDEO_PATTERN stays read-free
+        (docs/pattern-mode-design.md).
 
         :raises TimeoutError: if the source has not locked within ``timeout_s``.
         """
@@ -644,24 +675,9 @@ class DMD:
     ) -> None:
         """Display a static internal test pattern for optical alignment.
 
-        Brings the DMD from any state to a fixed, controller-generated pattern
-        on the mirrors — no HDMI source, GPU, LUT, or camera sync involved, so
-        the image never changes. One call: stop any running sequence, enter
-        VIDEO mode, then switch the input to the internal generator and select
-        the pattern + colors.
-
-        Order matters. VIDEO mode goes first, before the source select, for two
-        reasons: the 0x1A1B write re-initializes the video pipeline (selecting
-        the source first lets it fall back to the parallel/HDMI input, so the
-        HDMI image shows instead of the pattern), and per the DLPU018 command
-        matrix (Table A-2) Test Pattern Select/Color are not accepted in
-        VIDEO_PATTERN or the flash pattern modes, which is where a previous
-        acquisition run leaves the controller.
-
-        Writes only, then a blind settle wait — no status reads, since reads in a
-        video-active mode can hang the controller (SW1 to recover; see
-        docs/pattern-mode-design.md). Confirm the result by looking at the DMD,
-        not by polling USB status.
+        A fixed, controller-generated image — no HDMI, GPU, LUT or camera sync.
+        VIDEO mode is entered *before* the source select; the order is required
+        (docs/pattern-mode-design.md, "Internal test pattern").
         """
         self.stop_patterns()
         self.set_operating_mode(OperatingMode.VIDEO)

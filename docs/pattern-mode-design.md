@@ -102,17 +102,25 @@ To enable dual-pixel:
    HDMI cable suffices; DisplayPort or Premium-High-Speed HDMI for margin.
 2. **EDID** — program the EVM to advertise the native timing so the GPU outputs
    it (DLPU102 §3.13; GUI batch file + jumper J3/HDMI or J4/DP). *Not doable from
-   this client.* TI supplied a DP dual-pixel 60 Hz file
-   (`docs/edid/LCR9000_DP_EDID_2716_60Hz.txt`) — untested.
-3. **Port/clock** — *not* what we assumed. On this dual-controller board the
-   splitter FPGA hands each DLPC900 half the array (~135 Mpix/s at 2716x1600@60),
-   which is inside the 175 MHz single-pixel limit, so `PORT1_SINGLE` (`0x00`)
-   carries it. Measured over DP: `port2_syncs_valid` is False with `0x1A03` set
-   to `0x02` *and* `0x00`, identically — port 2 is not fed here, and status is
-   read from the primary controller only (DLPU102 3.7). `dmd stream-dp` defaults
-   to `PORT1_SINGLE`; `--dual-pixel` selects `0x02` for comparison. Dual-pixel
-   would be genuinely required on a *single*-controller EVM taking the whole
-   stream.
+   this client.* TI supplied the DP dual-pixel 60 Hz file
+   (`edid-files/LCR9000_DP_EDID_2716_60Hz.txt`); it is flashed and working.
+3. **Port/clock** — `PORT12_DUAL` (`0x1A03 = 0x02`) is required for the DP
+   timing, confirmed on the mirrors: at 269.89 Mpix/s the IT6535 cannot clock a
+   single-pixel bus (~270 MHz, over the 175 MHz limit), so it emits two pixels
+   per clock at ~135 MHz and the DLPC900 must consume both. `dmd stream` sets
+   the routing per source (DP dual, HDMI single) — it follows from the timing,
+   so it is not exposed as an option; the other value is simply broken.
+
+   **Two traps here, both cost us time.** (a) `port2_syncs_valid` reads False
+   even under a confirmed-working dual-pixel link — parallel-port status comes
+   from the primary controller only (DLPU102 §3.7) — so the sync bits cannot
+   tell you whether the routing is right; **only the image can**. The wrong
+   routing shows as a half-width, centered picture, never as a lock failure.
+   (b) A changed `data_port` does not take effect while the source is already
+   locked: the controller keeps its latched configuration and reports "locked in
+   0.0 s". `prepare_video_input()` now powers the IT6535 down for 0.5 s first to
+   force a real re-acquisition (~2.2 s). Powering it straight back up with no
+   pause leaves the link down indefinitely.
 4. FPGA that splits data to both controllers ships programmed.
 
 Over HDMI streaming the pattern rate is bandwidth-limited to ~native@60 →
@@ -136,9 +144,9 @@ DisplayPort, untested.
 
 ### EDID files
 
-See [`edid/README.md`](edid/README.md) for the full table. Both LCR9000 EDIDs are
-flashed (separate PROMs, J3 = HDMI, J4 = DP) and verified live with
-`scripts/check_edid.py`:
+See [`../edid-files/README.md`](../edid-files/README.md) for the full table. Both LCR9000 EDIDs are
+flashed (separate PROMs, J3 = HDMI, J4 = DP) and verified live by re-dumping the
+host-side EDID:
 
 | Input | EDID | Timing | Status |
 |--|--|--|--|
@@ -147,6 +155,17 @@ flashed (separate PROMs, J3 = HDMI, J4 = DP) and verified live with
 
 Both replaced the factory 165 MHz timing (348 px / 292 line blanking), which is
 the one that froze Video Pattern Mode on the first microscope.
+
+Flashing is TI's Windows GUI, DLPU102 §3.13 — the HDMI and DP procedures differ
+(different jumpers, different cable states). Always confirm a flash landed by
+re-dumping the host-side EDID rather than trusting the tool: bytes 0x36-0x37 of
+the EDID are the pixel clock, little-endian, in units of 10 kHz.
+
+```bash
+xxd -p /sys/class/drm/card*-DP-*/edid    # 0x696D = 269.89 MHz (DP)
+                                          # 0x369C = 139.80 MHz (HDMI)
+                                          # 165 MHz = still the factory EDID
+```
 
 ### Resolution / refresh options (decision reference)
 
@@ -161,7 +180,7 @@ the one that froze Video Pattern Mode on the first microscope.
   **2× rate**, same resolution.
 - 8-bit is the flat-field/grayscale case (÷8 vs 1-bit); all rows sit under the
   DLP670S 8-bit min-exposure ceiling (~247/s), so they're HDMI-limited.
-- **Decision: C is achieved** — TI's DP EDID flashed, `dmd stream-dp` locks, and
+- **Decision: C is achieved** — TI's DP EDID flashed, `dmd stream` locks, and
   full-screen video renders correctly across the array. A (HDMI/30 Hz) remains
   available as a fallback on its own PROM. Feasibility was predicted above (~137 MHz
   dual-pixel < 141 limit).
@@ -195,6 +214,21 @@ Order per pattern: mirrors flip → settle → `TRIG_OUT_1` high → camera expo
 LED on → next. Use `set_trigger_out_1(rising_delay_us=...)` to push the camera
 trigger past mirror settle. Bring-up tip: leave the LED continuously on first,
 prove DMD→camera sync, then add strobe→LED gating.
+
+## Internal test pattern (`dmd show`)
+
+The DLPC900 draws these itself (`0x1203`), so they need no HDMI, GPU, LUT or
+camera sync — the alignment reference. **Order matters:** VIDEO mode *first*,
+then input source -> test-pattern generator, then the pattern. Two reasons: the
+`0x1A1B` write re-initializes the video pipeline, so selecting the source first
+lets it fall back to the parallel input (you get the HDMI image, not the
+pattern); and per DLPU018 Table A-2 the pattern-select commands are not accepted
+in VIDEO_PATTERN or the flash pattern modes, which is where an acquisition run
+leaves the controller.
+
+`dmd show black` is a zeroed solid field, not pattern value 10 ("no pattern").
+Value 10 idles the generator rather than clearing the array, so the mirrors keep
+holding the last image — it reads as a no-op, and is deliberately not exposed.
 
 ## Live validation (deferred)
 
@@ -232,9 +266,10 @@ hypothesis. The evidence is strong against a *per-read* hazard and weak against 
 
 **Practical stance:**
 - **VIDEO mode — polling is fine.** `wait_for_video_lock()` polls main status
-  (`0x1A0C`) until the source locks, and `dmd stream-hdmi` reads the mode back to
-  confirm it is streaming. Lock now takes **0.8 s** on the reduced-blanking EDID,
-  down from 3.6 s on the factory timing.
+  (`0x1A0C`) until the source locks, and `dmd stream` reads the mode back to
+  confirm it is streaming. A forced re-acquisition locks in **~2.2 s** (0.8 s if
+  the link is merely re-entering VIDEO mode), against 3.6 s on the factory
+  timing.
 - **VIDEO_PATTERN mode — still read-free.** Nothing above covers it, and the
   original hang lived there (a `0x1A1B` read right after the transition). Enter
   by writes, and confirm via **external observation** (scope on `TRIG_OUT_1`,
@@ -248,7 +283,7 @@ hypothesis. The evidence is strong against a *per-read* hazard and weak against 
 - **Pattern exposure must match the frame time.** At 30 Hz (≈33 ms), 3 patterns →
   **~11000 µs each** (not 1500 µs, which is far too short and causes the
   frozen/flicker behavior). This is what `PatternSequence.frame_filling()` does.
-- **2716×1600 needs a special EDID** — TI supplied it; see `edid/README.md`.
+- **2716×1600 needs a special EDID** — TI supplied it; see `edid-files/README.md`.
 
 ### (original) VIDEO_PATTERN entry can hang the controller
 
