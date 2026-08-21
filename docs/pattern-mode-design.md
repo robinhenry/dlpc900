@@ -274,6 +274,26 @@ hypothesis. The evidence is strong against a *per-read* hazard and weak against 
   original hang lived there (a `0x1A1B` read right after the transition). Enter
   by writes, and confirm via **external observation** (scope on `TRIG_OUT_1`,
   camera) until that path is retested.
+- **Power Mode (`0x0200`) — never read soon after it.** Two SW1 resets on
+  2026-08-21 pinned this down. Both wedges followed Return to Normal
+  (`0x0200 = 0`) with reads a short time later: first a 0.2 s poll, then — after
+  "fixing" it — a 0.5 s settle plus sparse single reads. The second wedge
+  happened with the DMD **already awake**, so Return to Normal is *not* the
+  harmless no-op it looks like; it appears to kick an internal re-init, and
+  reads during that hang the command interface. Only the version that blind-waits
+  `WAKE_SETTLE_S` (5 s) and then reads *once* has ever worked.
+
+  What this does **not** mean is "reads are dangerous". The 93k-read soak above,
+  and `dmd stream`'s own lock poll right after writing `0x1A1B = VIDEO`, are both
+  clean across dozens of runs. The hazard is specific: reads shortly after a
+  *power-mode* command, plus the original `0x1A1B` read right after entering
+  VIDEO_PATTERN.
+
+  Consequence for the CLI: waking is an explicit `dmd wake`, never folded into
+  `dmd show` / `dmd stream`. Those commands must not touch `0x0200` at all — a
+  unit test enforces it. The safest resume path avoids the command entirely:
+  `dmd standby` parks the mirrors (writes only), then power-cycle; the controller
+  boots clean to OOB.
 - Keep a hardware recovery plan (SW1 / power-cycle) available before testing the
   pattern path. Reads remain fully reliable in PRE_STORED.
 

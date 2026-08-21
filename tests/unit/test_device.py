@@ -365,13 +365,26 @@ def test_run_pattern_sequence_writes_only_in_order(monkeypatch):
     assert _data(dev.writes[-1])[0] == 2  # start
 
 
-def test_prepare_for_shutdown_stops_then_standby():
+def test_enter_standby_stops_then_parks():
     dev = FakeReadDev()
-    device.DMD(dev).prepare_for_shutdown(wait=False)
-    # stop display, then Power Standby (parks the mirrors) — writes only.
+    device.DMD(dev).enter_standby(wait=False)
+    # stop display, then Power Standby (parks the mirrors) — writes only. No
+    # status reads: in standby the only accepted command is Return to Normal.
     assert [_cmd(w) for w in dev.writes] == [0x1A24, 0x0200]
     assert _data(dev.writes[0])[0] == 0
     assert _data(dev.writes[1])[0] == int(device.PowerMode.STANDBY)
+
+
+def test_wake_returns_to_normal_then_waits(monkeypatch):
+    # Blind wait, no polling: reading across this transition wedged the
+    # controller twice in testing (docs/pattern-mode-design.md).
+    slept = []
+    monkeypatch.setattr(device.time, "sleep", slept.append)
+    dev = FakeReadDev()
+    device.DMD(dev).wake()
+    assert [_cmd(w) for w in dev.writes] == [0x0200]
+    assert _data(dev.writes[0])[0] == int(device.PowerMode.NORMAL)
+    assert sum(slept) >= device.WAKE_SETTLE_S
 
 
 # --- lock polling -----------------------------------------------------------

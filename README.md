@@ -41,6 +41,8 @@ uv run dmd show --list              # list the pattern names
 uv run dmd stream                   # live video from the GPU (default: DisplayPort, 60 Hz)
 uv run dmd stream hdmi              # ... over HDMI (30 Hz) instead
 uv run dmd -v stream                # ... logging every USB command sent
+uv run dmd standby                  # park the mirrors, ready to power off
+uv run dmd wake                     # return to normal power
 ```
 
 `show` and `stream` correspond to two different image sources, and they are mutually exclusive. Both stay up until you change
@@ -70,6 +72,32 @@ DMD is streaming the live DisplayPort signal — confirmed by the controller:
   frames         changing (video not frozen)
   routing        dual-pixel (0x1A03 = 0x02)
 Native resolution. Stays up until you change modes.
+```
+
+### `dmd standby` / `dmd wake` — the resting state
+
+Standby parks the micromirrors, disables the input interfaces and powers down
+part of the DMD. Parking is what protects the array when it is not projecting,
+so run it when an experiment ends — and **always before a planned power-off**.
+
+Parking takes about two minutes, so `dmd standby` blocks until it is done —
+showing a countdown — and then tells you it is safe to cut power:
+
+```
+  ███████░░░░░░░░░░░░░░░░░░░░░  93s  parking the mirrors
+```
+
+`--no-wait` returns immediately instead. 
+While in standby, Return to Normal is the only command the controller accepts, so
+`dmd standby` deliberately reads no status back — it is the one command that
+cannot confirm its own result.
+
+**The most reliable way back is a power-cycle**, not `dmd wake`:
+
+```bash
+uv run dmd standby   # park the mirrors (writes only — safe)
+                     # ... power the EVM off, and on again later
+uv run dmd stream    # the controller boots clean; carry on
 ```
 
 ## As a library

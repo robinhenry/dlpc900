@@ -21,6 +21,7 @@ DLPC900_PRODUCT_ID = 0xC900
 # block; the caller waits.
 VIDEO_PATTERN_SETTLE_S = 0.3  # video-pattern transition
 STANDBY_WAIT_S = 123          # standby: ~2 min to park the array + 3 s
+WAKE_SETTLE_S = 5             # blind wait after Return to Normal, before reading
 
 # Pace between USB commands (TI's batch files use 5 ms; we use 10). Buffer
 # hygiene; does not fix the video-mode read hang (see docs).
@@ -483,27 +484,46 @@ class DMD:
         Entering STANDBY runs a ~2-minute park precondition (wait
         ``STANDBY_WAIT_S``); this call does not block. Once in standby only
         NORMAL is accepted (DLPU018 §2.3.1.1). For a safe power-off use
-        :meth:`prepare_for_shutdown`.
+        :meth:`enter_standby`.
         """
         self.write(0x0200, bytes([int(mode)]))
 
-    def prepare_for_shutdown(self, wait: bool = True) -> None:
-        """Park the mirrors and enter Standby so the DMD can be safely powered off.
+    def enter_standby(self, wait: bool = True) -> None:
+        """Park the mirrors and enter Standby — the resting state between uses.
 
-        Required before any planned power-down (DLPU018 §4.2, §2.3.1.1): Standby
-        parks the micromirrors and disables the front-end input interfaces,
-        protecting the DMD array. Stops any active display first, then issues
-        Power Standby (0x0200 = 1).
+        Standby parks the micromirrors, disables the front-end input interfaces
+        and powers down parts of the DMD, which is what protects the array over
+        long idle periods (DLPU018 §2.3.1.1, §2.3.1.2). It is also required
+        before any planned power-down.
 
-        Standby runs a ~2-minute precondition to park the array (plus ~3 s); with
-        ``wait=True`` (default) this blocks ``STANDBY_WAIT_S`` until parking is
-        complete, after which it is safe to remove power. Writes only — no status
-        reads (which can hang the controller). A power-cycle also clears standby.
+        Parking runs a ~2-minute precondition; ``wait=True`` (default) blocks
+        ``STANDBY_WAIT_S`` until it is complete, after which power can be removed
+        safely. **Do not send anything else while in standby** — the guide is
+        explicit that Return to Normal is the only accepted command and anything
+        else risks unexpected behavior, so this issues no status reads. Use
+        :meth:`wake` to come back; a power-cycle also clears standby.
         """
         self.stop_patterns()
         self.set_power_mode(PowerMode.STANDBY)
         if wait:
             time.sleep(STANDBY_WAIT_S)
+
+    def wake(self, wait: bool = True) -> None:
+        """Return to Normal from Standby (0x0200 = 0).
+
+        Blind wait, then let the caller read: polling across this transition
+        wedged the controller twice in testing (SW1 to recover), and so did
+        sending Return to Normal on an already-awake controller and reading
+        shortly after. Only call this when you actually want to wake the DMD —
+        it is not safe to sprinkle into other commands. See
+        docs/pattern-mode-design.md.
+
+        The input source and display mode are not restored; re-run whatever set
+        the display up (e.g. ``dmd stream``).
+        """
+        self.set_power_mode(PowerMode.NORMAL)
+        if wait:
+            time.sleep(WAKE_SETTLE_S)
 
     def set_operating_mode(self, mode: OperatingMode) -> None:
         """Set the display/operating mode (0x1A1B). To enter VIDEO_PATTERN use

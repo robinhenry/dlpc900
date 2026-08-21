@@ -4,6 +4,8 @@
     dmd show checkerboard       # static internal test pattern (optical alignment)
     dmd stream                  # live video signal, DisplayPort by default
     dmd -v stream hdmi          # ... over HDMI, logging every USB command
+    dmd standby                 # park the mirrors between uses / before power-off
+    dmd wake                    # bring it back
 
 `show` and `stream` are mutually exclusive input sources — each switches the
 controller away from the other, and both stay up until you change modes or
@@ -13,9 +15,12 @@ power-cycle. See docs/pattern-mode-design.md for the mode background.
 import argparse
 import logging
 import sys
+import time
 
 from dmd_client.device import (
+    STANDBY_WAIT_S,
     DataPort,
+    DeviceError,
     DeviceNotFoundError,
     DevicePermissionError,
     IT6535Power,
@@ -26,6 +31,13 @@ from dmd_client.device import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A controller that stops answering needs the hardware button; a software
+# reset uses the same hung command path (docs/pattern-mode-design.md).
+WEDGED_HINT = (
+    "The controller is not answering. Either it is in standby (run `dmd wake`) "
+    "or it has wedged — press SW1 on the EVM to reset it."
+)
 
 WHITE = (1023, 1023, 1023)
 BLACK = (0, 0, 0)
@@ -126,8 +138,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     try:
         with connect() as dmd:
             dmd.show_test_pattern(pattern, foreground=foreground)
-    except (DeviceNotFoundError, DevicePermissionError) as exc:
+    except (DeviceNotFoundError, DevicePermissionError, TimeoutError) as exc:
         logger.error("%s", exc)
+        return 1
+    except DeviceError as exc:
+        logger.error("%s\n%s", exc, WEDGED_HINT)
         return 1
 
     logger.info("Showing static '%s' pattern on the DMD.", args.pattern)
@@ -159,8 +174,11 @@ def cmd_stream(args: argparse.Namespace) -> int:
                 return 1
             mode = dmd.operating_mode()
             status = dmd.main_status()
-    except (DeviceNotFoundError, DevicePermissionError) as exc:
+    except (DeviceNotFoundError, DevicePermissionError, TimeoutError) as exc:
         logger.error("%s", exc)
+        return 1
+    except DeviceError as exc:
+        logger.error("%s\n%s", exc, WEDGED_HINT)
         return 1
 
     if mode is not OperatingMode.VIDEO or not status.streaming:
@@ -185,6 +203,84 @@ def cmd_stream(args: argparse.Namespace) -> int:
         "already locked" if outcome == "unchanged" else f"locked in {lock_s:.1f} s",
         "dual-pixel" if dual else "single-pixel", int(data_port),
     )
+    return 0
+
+
+def _countdown(seconds: int, label: str) -> None:
+    """Wait ``seconds``, showing a progress bar on a terminal.
+
+    Purely local — the DMD is parking and must not be sent anything. Falls back
+    to a plain sleep when stdout is not a TTY, so pipes and logs stay clean.
+    """
+    if not sys.stdout.isatty():
+        time.sleep(seconds)
+        return
+
+    width = 28
+    try:
+        for elapsed in range(seconds):
+            filled = round(width * elapsed / seconds)
+            bar = "█" * filled + "░" * (width - filled)
+            sys.stdout.write(f"\r  {bar} {seconds - elapsed:3d}s  {label}")
+            sys.stdout.flush()
+            time.sleep(1)
+    finally:
+        sys.stdout.write("\r\033[K")  # clear the line, whatever happened
+        sys.stdout.flush()
+
+
+def cmd_standby(args: argparse.Namespace) -> int:
+    """Park the mirrors and enter standby."""
+    try:
+        with connect() as dmd:
+            # The wait is the caller's: nothing may be sent while parking, so
+            # the countdown below never touches the device.
+            dmd.enter_standby(wait=False)
+            if args.no_wait:
+                logger.info(
+                    "DMD entering standby. Parking the mirrors takes about "
+                    "%d s — do not power it off or run `dmd wake` before then.",
+                    STANDBY_WAIT_S,
+                )
+                return 0
+            logger.info("Parking the mirrors and entering standby...")
+            try:
+                _countdown(STANDBY_WAIT_S, "parking the mirrors")
+            except KeyboardInterrupt:
+                logger.warning(
+                    "Interrupted — the DMD is still parking. Give it the rest of "
+                    "the %d s before powering off or waking it.",
+                    STANDBY_WAIT_S,
+                )
+                return 130
+    except (DeviceNotFoundError, DevicePermissionError) as exc:
+        logger.error("%s", exc)
+        return 1
+    except DeviceError as exc:
+        logger.error("%s\n%s", exc, WEDGED_HINT)
+        return 1
+
+    logger.info("DMD is parked and in standby. Safe to power off; `dmd wake` to resume.")
+    return 0
+
+
+def cmd_wake(_args: argparse.Namespace) -> int:
+    """Return the DMD to normal power from standby."""
+    try:
+        with connect() as dmd:
+            dmd.wake()
+            hw = dmd.hardware_status()
+    except (DeviceNotFoundError, DevicePermissionError) as exc:
+        logger.error("%s", exc)
+        return 1
+    except DeviceError as exc:
+        logger.error("%s\n%s", exc, WEDGED_HINT)
+        return 1
+
+    if not hw.initialized:
+        logger.error("DMD did not come back initialized after waking")
+        return 1
+    logger.info("DMD is awake. Run `dmd stream` or `dmd show` to put an image up.")
     return 0
 
 
@@ -238,6 +334,20 @@ def build_parser() -> argparse.ArgumentParser:
         "(the host sees a monitor unplug/replug)",
     )
     stream.set_defaults(func=cmd_stream)
+
+    standby = subparsers.add_parser(
+        "standby",
+        help="park the mirrors and enter standby (between uses, or before power-off)",
+    )
+    standby.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="return immediately instead of waiting for parking to finish",
+    )
+    standby.set_defaults(func=cmd_standby)
+
+    wake = subparsers.add_parser("wake", help="return to normal power from standby")
+    wake.set_defaults(func=cmd_wake)
 
     return parser
 
