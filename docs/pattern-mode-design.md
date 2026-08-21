@@ -103,16 +103,23 @@ To enable dual-pixel:
 2. **EDID** — program the EVM to advertise the native timing so the GPU outputs
    it (DLPU102 §3.13; GUI batch file + jumper J3/HDMI or J4/DP). *Not doable from
    this client.* TI supplied a DP dual-pixel 60 Hz file
-   (`docs/edid/LCR9000_DP_EDID_2716_2560_60Hz.txt`) — untested.
-3. **Port/clock** — `set_port_clock(DataPort.PORT12_DUAL)` → `0x1A03 = 0x02`
-   (Dual Pixel, Port 1-2, **Clock 1** — Clock 2/3 are not wired on the EVM).
+   (`docs/edid/LCR9000_DP_EDID_2716_60Hz.txt`) — untested.
+3. **Port/clock** — *not* what we assumed. On this dual-controller board the
+   splitter FPGA hands each DLPC900 half the array (~135 Mpix/s at 2716x1600@60),
+   which is inside the 175 MHz single-pixel limit, so `PORT1_SINGLE` (`0x00`)
+   carries it. Measured over DP: `port2_syncs_valid` is False with `0x1A03` set
+   to `0x02` *and* `0x00`, identically — port 2 is not fed here, and status is
+   read from the primary controller only (DLPU102 3.7). `dmd stream-dp` defaults
+   to `PORT1_SINGLE`; `--dual-pixel` selects `0x02` for comparison. Dual-pixel
+   would be genuinely required on a *single*-controller EVM taking the whole
+   stream.
 4. FPGA that splits data to both controllers ships programmed.
 
 Over HDMI streaming the pattern rate is bandwidth-limited to ~native@60 →
 ~1,440 1-bit patterns/s (~180/s at 8-bit). The DLP670S peak (9,523 Hz, ~41 Gbit/s)
 is only reachable in **pre-stored (flash) mode**, not HDMI — a different path.
 
-### Is 2716×1600 @ 60 Hz (full-res dual-pixel) possible? YES.
+### Is 2716×1600 @ 60 Hz (full-res) possible? YES — confirmed on hardware.
 
 Confirmed against DLPC900 datasheet (DLPS037H): single-pixel max clock 175 MHz
 (§5.11), dual-pixel max 141 MHz (§5.12), min blanking 80 px H / ~370 µs V (§5.16).
@@ -124,33 +131,39 @@ clears: IT6535 input ~275 MHz < 340 (HDMI 1.4), cable ~6.6 Gbit/s < 10.2.
 Requires: a reduced-blanking EDID (that DTD as *preferred*, fixed checksum) +
 `set_port_clock(DataPort.PORT12_DUAL)` (`0x02`). Thin margin → validate lock
 empirically (revert to `LCR670S_HDMI_EDID.txt` if it doesn't hold). No crafting
-needed: TI supplied the file via E2E — `LCR9000_DP_EDID_2716_2560_60Hz.txt`,
+needed: TI supplied the file via E2E — `LCR9000_DP_EDID_2716_60Hz.txt`,
 DisplayPort, untested.
 
 ### EDID files
 
-See [`edid/README.md`](edid/README.md) for the full table. **Currently flashed
-and verified live on the link: `LCR9000_HDMI_EDID_2716_30Hz.txt`** — 2716×1600 @
-30 Hz, single-pixel, reduced blanking (139.8 MHz, confirmed by re-dumping the
-host-side EDID). This replaced the factory 165 MHz timing, which is the one that
-froze Video Pattern Mode on the first microscope.
+See [`edid/README.md`](edid/README.md) for the full table. Both LCR9000 EDIDs are
+flashed (separate PROMs, J3 = HDMI, J4 = DP) and verified live with
+`scripts/check_edid.py`:
+
+| Input | EDID | Timing | Status |
+|--|--|--|--|
+| HDMI | `LCR9000_HDMI_EDID_2716_30Hz.txt` | 2716×1600@29.95, 139.8 MHz | working |
+| DP | `LCR9000_DP_EDID_2716_60Hz.txt` | 2716×1600@59.92, 269.89 MHz | **working — full-screen video confirmed on the DMD** |
+
+Both replaced the factory 165 MHz timing (348 px / 292 line blanking), which is
+the one that froze Video Pattern Mode on the first microscope.
 
 ### Resolution / refresh options (decision reference)
 
 | Option | Resolution | fps | 1-bit pat/s | 8-bit pat/s | Pixel mode | Effort |
 |--|--|--|--|--|--|--|
-| **A** (running now) | 2716×1600 | 30 | 720 | 90 | single | none — EDID flashed |
-| **B** | 2048×1200 | 60 | 1440 | 180 | single | free reflash (`LCR670S_9000_..._HDMI`) |
-| **C** ★ chosen target | 2716×1600 | 60 | 1440 | 180 | dual | custom EDID + Windows flash |
+| **A** | 2716×1600 | 30 | 720 | 90 | single | HDMI, EDID flashed — works |
+| **B** | 2048×1200 | 60 | 1440 | 180 | single | superseded by C |
+| **C** ★ **running now** | 2716×1600 | 60 | 1440 | 180 | single per controller | DP, EDID flashed — works |
 
 - **60 Hz alone is free** (B, single-pixel reduced-res). **C's exclusive gain** is
   full resolution *at* 60 Hz — vs B: same rate, **1.77× more micromirrors**; vs A:
   **2× rate**, same resolution.
 - 8-bit is the flat-field/grayscale case (÷8 vs 1-bit); all rows sit under the
   DLP670S 8-bit min-exposure ceiling (~247/s), so they're HDMI-limited.
-- **Decision:** target **C** when full-res-and-60 Hz is actually needed (and the
-  optics resolve 2716×1600 at the sample). For now run **A** — zero effort. C is
-  deferred (TI's DP EDID + Windows flash); feasibility confirmed above (~137 MHz
+- **Decision: C is achieved** — TI's DP EDID flashed, `dmd stream-dp` locks, and
+  full-screen video renders correctly across the array. A (HDMI/30 Hz) remains
+  available as a fallback on its own PROM. Feasibility was predicted above (~137 MHz
   dual-pixel < 141 limit).
 
 Still needed:

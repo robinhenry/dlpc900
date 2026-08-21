@@ -329,6 +329,13 @@ def test_main_status_unlocked_is_not_streaming():
     assert not device.MainStatus.from_byte(0b000000).streaming
 
 
+def test_port2_is_not_required_even_at_dual_pixel():
+    # Measured on our dual-controller board: port2_syncs_valid reads False with
+    # 0x1A03 = 0x02 and 0x00 alike, because the splitter FPGA feeds each
+    # controller half the array on port 1. Requiring it only invents failures.
+    assert device.MainStatus.from_byte(0b011010).streaming
+
+
 def test_wait_for_video_lock_returns_once_locked(monkeypatch):
     dmd = device.DMD(FakeReadDev())
     # Not locked, not locked, then locked — the real bring-up shape.

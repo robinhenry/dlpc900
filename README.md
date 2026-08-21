@@ -25,6 +25,7 @@ uv run dmd show checkerboard         # static test pattern, for optical alignmen
 uv run dmd show black                # all mirrors off (a zeroed solid field)
 uv run dmd show --list               # list the pattern names
 uv run dmd stream-hdmi               # show the live HDMI signal on the DMD
+uv run dmd stream-dp                 # same over DisplayPort, dual-pixel @ 60 Hz
 uv run python -m dmd_client status   # same CLI, as a module
 ```
 
@@ -53,6 +54,20 @@ DMD is streaming the live HDMI signal — confirmed by the controller:
 
 It exits non-zero if the source never locks (dead cable, GPU not driving the
 output) instead of silently claiming success.
+
+`dmd stream-dp` is the same thing over DisplayPort at **2716×1600 @ 60 Hz**, the
+full-resolution path (~270 Mpix/s). One DLPC900 could not take that on a single
+port, but this is a dual-controller board: the Video Splitter FPGA gives each
+controller half the array (~135 Mpix/s), inside the single-pixel limit — so the
+routing stays `PORT1_SINGLE` like the HDMI path. `--dual-pixel` selects
+`0x1A03 = 0x02` instead; both lock identically here. Requires the DP EDID to be
+flashed — see [`docs/edid/README.md`](docs/edid/README.md).
+`scripts/check_edid.py` verifies which EDID is live:
+
+```bash
+uv run scripts/check_edid.py                       # decode the live link
+uv run scripts/check_edid.py --file docs/edid/...  # decode a TI batch file offline
+```
 
 The library locates the DMD automatically by its USB vendor/product ID
 (`0451:c900`), so it does not matter which USB port or bus the device is on —

@@ -208,7 +208,20 @@ class MainStatus:
 
     @property
     def streaming(self) -> bool:
-        """True when the controller is locked to the source and showing new frames."""
+        """True when locked to the source and showing new frames.
+
+        Port 2 is deliberately not required, even at dual-pixel/60 Hz. This is a
+        *dual-controller* board (DLP670S behind two DLPC900s): the Video Splitter
+        FPGA hands each controller half the array, ~135 Mpix/s at 2716x1600@60 —
+        under the 175 MHz single-pixel limit — so each controller reads its half
+        on port 1 alone. Status is also read from the primary controller only
+        (DLPU102 3.7), so the secondary's state never appears here regardless.
+
+        Measured on our board over the DP input: ``port2_syncs_valid`` is False
+        with 0x1A03 = 0x02 (dual) *and* 0x00 (single), identically. Requiring it
+        only produces false failures. On a single-controller EVM taking the whole
+        stream, dual-pixel would genuinely need both ports.
+        """
         return self.source_locked and self.port1_syncs_valid and not self.video_frozen
 
 
@@ -566,11 +579,13 @@ class DMD:
         timeout_s: float = LOCK_TIMEOUT_S,
         interval_s: float = LOCK_POLL_INTERVAL_S,
     ) -> float:
-        """Poll main status until the HDMI source locks; return the seconds it took.
+        """Poll main status until the video source locks; return the seconds it took.
 
         Replaces a blind wait in plain VIDEO mode: it returns as soon as the
         source is actually locked, and distinguishes "not locked yet" from "never
-        going to lock" (dead cable, GPU not driving the output).
+        going to lock" (dead cable, GPU not driving the output). Waits on port 1
+        only — see :attr:`MainStatus.streaming` for why port 2 never comes up on
+        this board.
 
         Only for VIDEO mode. Status reads in a video-active mode were long treated
         as unsafe (docs/pattern-mode-design.md), but that no longer reproduces on
@@ -588,9 +603,10 @@ class DMD:
                 return time.monotonic() - start
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"HDMI source did not lock within {timeout_s:g} s "
+                    f"video source did not lock within {timeout_s:g} s "
                     f"(source_locked={status.source_locked}, "
-                    f"port1_syncs_valid={status.port1_syncs_valid})"
+                    f"port1_syncs_valid={status.port1_syncs_valid}, "
+                    f"port2_syncs_valid={status.port2_syncs_valid})"
                 )
             time.sleep(interval_s)
 

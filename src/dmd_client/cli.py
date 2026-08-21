@@ -6,16 +6,18 @@ Subcommands::
     dmd show checkerboard       # put a static internal test pattern on the DMD
     dmd show --list             # list the pattern names
     dmd stream-hdmi             # display the live HDMI signal on the DMD
+    dmd stream-dp               # same, over DisplayPort at 60 Hz
 
 ``show`` drives the DLPC900's internal test-pattern generator: the controller
 draws the image itself, so nothing depends on HDMI, the GPU, a pattern LUT, or
 camera sync, and the image on the mirrors never changes. That makes it the
 reference to align and focus the optics against.
 
-``stream-hdmi`` is the opposite source: plain VIDEO mode, mirrors showing
-whatever the GPU streams over HDMI. The two are mutually exclusive — each
-switches the input source away from the other — and both stay up until you
-change modes (e.g. start an acquisition sequence) or power-cycle.
+``stream-hdmi`` / ``stream-dp`` are the opposite source: plain VIDEO mode,
+mirrors showing whatever the GPU streams over the video link. All of these are
+mutually exclusive — each switches the input source away from the others — and
+they stay up until you change modes (e.g. start an acquisition sequence) or
+power-cycle.
 """
 
 import argparse
@@ -89,8 +91,18 @@ def cmd_show(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
-    """Display the live HDMI signal on the DMD (plain VIDEO mode)."""
+def _stream(
+    receiver: IT6535Power,
+    data_port: DataPort,
+    source: str,
+    pixel_mode: str,
+    hint: str,
+) -> int:
+    """Enter VIDEO mode on one video input and confirm the DMD is streaming it.
+
+    Shared by stream-hdmi and stream-dp: the sequence is identical, only the
+    receiver (0x1A01) and the port/clock routing (0x1A03) differ.
+    """
     try:
         with connect() as dmd:
             # Catches a controller/DMD mismatch before touching the video path.
@@ -102,11 +114,9 @@ def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
                 print("error: controller not initialized yet", file=sys.stderr)
                 return 1
 
-            # Stop, power the HDMI receiver, single-pixel 24-bit parallel input,
-            # gamma off, enter VIDEO mode.
-            dmd.prepare_video_input(
-                receiver=IT6535Power.HDMI, data_port=DataPort.PORT1_SINGLE
-            )
+            # Stop, power the receiver, 24-bit parallel input, the requested
+            # port/clock routing, gamma off, enter VIDEO mode.
+            dmd.prepare_video_input(receiver=receiver, data_port=data_port)
 
             # Then confirm it worked, rather than waiting blind and hoping: poll
             # until the source locks, and read back the mode and frame state.
@@ -114,11 +124,7 @@ def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
                 lock_s = dmd.wait_for_video_lock()
             except TimeoutError as exc:
                 print(f"error: {exc}", file=sys.stderr)
-                print(
-                    "Check the HDMI cable and that the GPU is driving the DMD "
-                    "output.",
-                    file=sys.stderr,
-                )
+                print(hint, file=sys.stderr)
                 return 1
             mode = dmd.operating_mode()
             status = dmd.main_status()
@@ -131,18 +137,58 @@ def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
             f"error: DMD did not reach a streaming state "
             f"(mode={mode}, locked={status.source_locked}, "
             f"port1_syncs_valid={status.port1_syncs_valid}, "
+            f"port2_syncs_valid={status.port2_syncs_valid}, "
             f"video_frozen={status.video_frozen})",
             file=sys.stderr,
         )
         return 1
 
-    print("DMD is streaming the live HDMI signal — confirmed by the controller:")
+    print(f"DMD is streaming the live {source} signal — confirmed by the controller:")
     print(f"  mode           {mode}")
     print(f"  source         locked in {lock_s:.1f} s")
     print("  port 1 syncs   valid")
     print("  frames         changing (video not frozen)")
-    print("Native resolution, single-pixel. Stays up until you change modes.")
+    print(f"  routing        {pixel_mode} (0x1A03 = {int(data_port):#04x})")
+    print("Native resolution. Stays up until you change modes.")
     return 0
+
+
+def cmd_stream_hdmi(_args: argparse.Namespace) -> int:
+    """Display the live HDMI signal on the DMD (plain VIDEO mode)."""
+    return _stream(
+        receiver=IT6535Power.HDMI,
+        data_port=DataPort.PORT1_SINGLE,
+        source="HDMI",
+        pixel_mode="single-pixel",
+        hint="Check the HDMI cable and that the GPU is driving the DMD output.",
+    )
+
+
+def cmd_stream_dp(args: argparse.Namespace) -> int:
+    """Display the live DisplayPort signal on the DMD (plain VIDEO mode).
+
+    The full-resolution 60 Hz path: 2716x1600 @ 60 is ~270 Mpix/s, which a single
+    DLPC900 could not take on one port — but the Video Splitter FPGA gives each
+    of the two controllers half the array (~135 Mpix/s), inside the single-pixel
+    limit. So the default routing is PORT1_SINGLE, same as the HDMI path; both
+    routings lock identically on our board (see MainStatus.streaming).
+    ``--dual-pixel`` selects 0x1A03 = 0x02 for comparison.
+
+    Requires the DP EDID to be flashed (docs/edid/, DLPU102 3.13) — without it
+    the GPU will not offer the timing and the source never locks.
+    """
+    dual = getattr(args, "dual_pixel", False)
+    return _stream(
+        receiver=IT6535Power.DISPLAYPORT,
+        data_port=DataPort.PORT12_DUAL if dual else DataPort.PORT1_SINGLE,
+        source="DisplayPort",
+        pixel_mode="dual-pixel" if dual else "single-pixel per controller",
+        hint=(
+            "Check the DP cable is in J2, that the DP EDID is flashed "
+            "(docs/edid/README.md), and that the GPU is actually driving "
+            "2716x1600 @ 60 Hz."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -175,6 +221,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="display the live HDMI signal on the DMD (plain VIDEO mode)",
     )
     stream.set_defaults(func=cmd_stream_hdmi)
+
+    stream_dp = subparsers.add_parser(
+        "stream-dp",
+        help="display the live DisplayPort signal at 60 Hz (needs the DP EDID)",
+    )
+    stream_dp.add_argument(
+        "--dual-pixel",
+        action="store_true",
+        help="route as dual-pixel (0x1A03 = 0x02) instead of the default port 1",
+    )
+    stream_dp.set_defaults(func=cmd_stream_dp)
 
     return parser
 

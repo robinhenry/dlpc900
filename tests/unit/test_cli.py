@@ -180,3 +180,52 @@ def test_stream_hdmi_refuses_an_uninitialized_controller(monkeypatch, capsys):
     assert cli.main(["stream-hdmi"]) == 1
     assert "not initialized" in capsys.readouterr().err
     assert dmd.calls == []
+
+
+def test_stream_dp_uses_displayport_on_port1_by_default(monkeypatch):
+    # The splitter FPGA halves the stream per controller, so port 1 is enough
+    # even at 60 Hz — and port 2 never syncs on this board either way.
+    dmd = _patch_connect(monkeypatch, FakeDMD())
+    assert cli.main(["stream-dp"]) == 0
+    assert dmd.calls == [
+        ("prepare_video_input", device.IT6535Power.DISPLAYPORT,
+         device.DataPort.PORT1_SINGLE),
+        ("wait_for_video_lock",),
+    ]
+
+
+def test_stream_dp_dual_pixel_flag_switches_routing(monkeypatch):
+    dmd = _patch_connect(monkeypatch, FakeDMD())
+    assert cli.main(["stream-dp", "--dual-pixel"]) == 0
+    assert dmd.calls[0] == (
+        "prepare_video_input",
+        device.IT6535Power.DISPLAYPORT,
+        device.DataPort.PORT12_DUAL,
+    )
+
+
+def test_stream_dp_succeeds_without_port2(monkeypatch, capsys):
+    # 0b011010 = locked, port 1 valid, port 2 NOT valid — the real board state.
+    _patch_connect(monkeypatch, FakeDMD(main=device.MainStatus.from_byte(0b011010)))
+    assert cli.main(["stream-dp"]) == 0
+    out = capsys.readouterr().out
+    assert "DisplayPort" in out
+    assert "0x1A03 = 0x00" in out
+
+
+def test_stream_dp_timeout_points_at_the_dp_prerequisites(monkeypatch, capsys):
+    _patch_connect(
+        monkeypatch, FakeDMD(lock_error=TimeoutError("video source did not lock"))
+    )
+    assert cli.main(["stream-dp"]) == 1
+    err = capsys.readouterr().err
+    assert "DP EDID" in err and "J2" in err
+
+
+def test_stream_hdmi_still_single_pixel_over_hdmi(fake_dmd, capsys):
+    # The DP work must not disturb the validated HDMI path.
+    assert cli.main(["stream-hdmi"]) == 0
+    assert fake_dmd.calls[0] == (
+        "prepare_video_input", device.IT6535Power.HDMI, device.DataPort.PORT1_SINGLE
+    )
+    assert "single-pixel" in capsys.readouterr().out
