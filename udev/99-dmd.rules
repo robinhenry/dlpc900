@@ -1,0 +1,9 @@
+# Texas Instruments DLPC900 (DMD controller) — grant non-root access.
+# Install:  sudo cp udev/99-dmd.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then unplug and replug the DMD.
+#
+# The bundled hidapi uses the libusb backend, so access is needed on the USB
+# device node (/dev/bus/usb/...). The hidraw line covers a hidraw-backend build.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0451", ATTRS{idProduct}=="c900", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0451", ATTRS{idProduct}=="c900", MODE="0660", GROUP="plugdev", TAG+="uaccess"
