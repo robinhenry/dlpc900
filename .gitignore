@@ -11,3 +11,6 @@ wheels/
 
 # Test / tool caches
 .pytest_cache/
+
+# Claude Code project state
+.claude/
