@@ -1,22 +1,24 @@
 [project]
-name = "dmd-client"
+name = "dlpc900"
 version = "0.1.0"
-description = "HID client for the DMD (digital micromirror device)"
+description = "HID client for the TI DLPC900 DMD controller"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "hidapi>=0.15.0",
 ]
 
 [project.scripts]
-dmd = "dmd_client.cli:main"
+dmd = "dlpc900.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dmd_client"]
+packages = ["src/dlpc900"]
 
 [dependency-groups]
 dev = [

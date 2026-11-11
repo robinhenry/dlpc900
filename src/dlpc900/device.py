@@ -222,7 +222,7 @@ class MainStatus:
         """True when locked to the source and showing new frames.
 
         Port 2 is not required: it reads False even on a working dual-pixel link
-        (docs/pattern-mode-design.md, "Port/clock").
+        (docs/pattern-mode-design.md, "Port and clock routing").
         """
         return self.source_locked and self.port1_syncs_valid and not self.video_frozen
 
@@ -568,7 +568,7 @@ class DMD:
 
         BOARD-SPECIFIC. Single- vs dual-pixel depends on the HDMI video timing.
         ``PORT1_SINGLE`` (the reset value, 0x00) is the validated HDMI lock on
-        our board; dual-pixel (``PORT12_DUAL``, 0x02) needs the matching EDID.
+        the board used in this project; dual-pixel (``PORT12_DUAL``, 0x02) needs the matching EDID.
         The pixel-clock/data-enable/sync select bits are 0 for both, so only the
         port field is set here.
         """
@@ -608,7 +608,7 @@ class DMD:
         A *live* parallel link keeps its latched routing, so changing
         ``data_port`` there requires dropping the link — the receiver is powered
         down for ``RECEIVER_RESET_S``, else the change is silently ignored
-        (docs/pattern-mode-design.md, "Port/clock"). The host sees that as a
+        (docs/pattern-mode-design.md, "Port and clock routing"). The host sees that as a
         monitor unplug/replug and re-lays-out every display, so it is done only
         when needed: not when the input is already configured as asked, and not
         when coming from another input source (the source switch re-acquires by

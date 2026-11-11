@@ -9,8 +9,8 @@ from contextlib import contextmanager
 
 import pytest
 
-import dmd_client.cli as cli
-import dmd_client.device as device
+import dlpc900.cli as cli
+import dlpc900.device as device
 
 
 class FakeStatus:
@@ -253,7 +253,7 @@ def test_stream_refuses_an_unhealthy_controller(monkeypatch, capsys, status, mes
 
 def test_verbose_enables_debug_logging_without_touching_the_root_logger(fake_dmd):
     assert cli.main(["-v", "stream"]) == 0
-    package_logger = logging.getLogger("dmd_client")
+    package_logger = logging.getLogger("dlpc900")
     assert package_logger.level == logging.DEBUG
     assert not package_logger.propagate  # importing us must not hijack an app
 
@@ -261,7 +261,7 @@ def test_verbose_enables_debug_logging_without_touching_the_root_logger(fake_dmd
 def test_logging_setup_does_not_stack_handlers(fake_dmd):
     for _ in range(3):
         cli.main(["stream"])
-    assert len(logging.getLogger("dmd_client").handlers) == 2  # stdout + stderr
+    assert len(logging.getLogger("dlpc900").handlers) == 2  # stdout + stderr
 
 
 # --- standby / wake -----------------------------------------------------------

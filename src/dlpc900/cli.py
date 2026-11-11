@@ -17,7 +17,7 @@ import logging
 import sys
 import time
 
-from dmd_client.device import (
+from dlpc900.device import (
     STANDBY_WAIT_S,
     DataPort,
     DeviceError,
@@ -63,7 +63,7 @@ PATTERNS: dict[str, tuple[TestPattern, tuple[int, int, int]]] = {
 # locks). DP is the default: 60 Hz vs HDMI's 30 at the same resolution. The
 # routing is a property of the timing, not a choice: DP's 269.89 MHz is over the
 # 175 MHz single-pixel limit so the IT6535 sends two pixels per clock, while
-# HDMI's 139.8 MHz sends one. See docs/pattern-mode-design.md ("Port/clock").
+# HDMI's 139.8 MHz sends one. See docs/pattern-mode-design.md ("Port and clock routing").
 SOURCES = {
     "dp": (
         IT6535Power.DISPLAYPORT,
@@ -95,10 +95,10 @@ class _MaxLevel(logging.Filter):
 def configure_logging(verbose: bool = False) -> None:
     """Send package logs to the console: results to stdout, problems to stderr.
 
-    Configures the ``dmd_client`` logger rather than the root logger, so
+    Configures the ``dlpc900`` logger rather than the root logger, so
     importing this package never hijacks an application's logging.
     """
-    package_logger = logging.getLogger("dmd_client")
+    package_logger = logging.getLogger("dlpc900")
     for handler in list(package_logger.handlers):
         package_logger.removeHandler(handler)
 

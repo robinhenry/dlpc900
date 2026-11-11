@@ -1,7 +1,7 @@
-"""dmd-client — HID client for the DMD (digital micromirror device)."""
+"""dlpc900 — HID client for the TI DLPC900 DMD controller."""
 
-from dmd_client.cli import main
-from dmd_client.device import (
+from dlpc900.cli import main
+from dlpc900.device import (
     DMD,
     DeviceError,
     DeviceNotFoundError,

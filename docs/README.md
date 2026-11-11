@@ -1,7 +1,6 @@
 # Reference documents
 
-Texas Instruments guides for the DLPC900 controller (our board is a DLPC900
-driving a DLP670S DMD).
+Texas Instruments guides for the DLPC900 controller. The board used in this project is a Dual DLPC900 EVM driving a DLP670S DMD.
 
 | File | TI doc | Contents |
 |--|--|--|
@@ -10,16 +9,12 @@ driving a DLP670S DMD).
 | `dlpc900-datasheet.pdf` | DLPS037H | Controller datasheet. Pixel-clock limits: **175 MHz single-pixel (§5.11), 141 MHz dual-pixel (§5.12)**; min blanking (§5.16). |
 | `dlp670s-datasheet.pdf` | — | DMD datasheet. 2716×1600 array; pattern rates. |
 
-Status-command register/bit definitions used by `device.py` come from DLPU018
-§2.1 (Tables 2-2, 2-6, 2-8, 2-10).
+Status-command register/bit definitions used by `device.py` come from DLPU018 §2.1 (Tables 2-2, 2-6, 2-8, 2-10).
 
 ## Design notes
 
-- [`pattern-mode-design.md`](pattern-mode-design.md) — how we drive the DMD
-  (multi-bit Video Pattern Mode, per-pattern sync, flat-field correction) and
-  what the client still needs to implement.
+- [`pattern-mode-design.md`](pattern-mode-design.md) — how the client drives the DMD (multi-bit Video Pattern Mode, per-pattern sync, flat-field correction), the controller behaviours that shaped the code, what is validated on hardware, and what remains.
 
 ## EDID
 
-[`../edid-files/README.md`](../edid-files/README.md) — the EDID files for the DMD's HDMI/DP input,
-which one is flashed, and how to reflash (TI's Windows tool + the J3 jumper).
+[`../edid-files/README.md`](../edid-files/README.md) — the EDID files for the DMD's HDMI/DP input, which one is flashed, and how to reflash (TI's Windows tool + the J3 jumper).

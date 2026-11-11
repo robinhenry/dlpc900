@@ -1,7 +1,7 @@
 """Hardware identity tests — assert the connected board's firmware and type.
 
 Run: uv run pytest -m hardware
-Values are specific to our DLP670S board; update them if the board or its
+Values are specific to the DLP670S board used in this project; update them if the board or its
 firmware changes.
 """
 

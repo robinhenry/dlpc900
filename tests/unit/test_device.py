@@ -9,7 +9,7 @@ import struct
 
 import pytest
 
-import dmd_client.device as device
+import dlpc900.device as device
 
 INFO = {"path": b"1-4:1.0", "vendor_id": 0x0451, "product_id": 0xC900}
 

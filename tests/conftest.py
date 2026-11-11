@@ -1,8 +1,8 @@
-"""Shared pytest fixtures for the dmd-client test suite."""
+"""Shared pytest fixtures for the dlpc900 test suite."""
 
 import pytest
 
-from dmd_client.device import connect, find_device
+from dlpc900.device import connect, find_device
 
 
 @pytest.fixture(scope="session")
